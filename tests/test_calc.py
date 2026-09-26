@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.calc import calculate, normalize, simulate, suggest_posts  # noqa: E402
+from app.calc import calculate, normalize, relieve_load, simulate, suggest_posts  # noqa: E402
 
 SAMPLE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -478,6 +478,267 @@ class CalcTests(unittest.TestCase):
         before = json.loads(json.dumps(state, ensure_ascii=False))
         suggest_posts(state, 0, 100, 300)
         self.assertEqual(state, before)
+
+    # ---------------- 减载配额试算 ----------------
+    def test_relief_single_layer_reduces_ware(self):
+        # 单层：板 100 + 坯 100 = 200，两根柱各 100；容量 80 → T≤160 → 坯减 40
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 80},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 80},
+                    ],
+                }
+            ],
+        }
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        self.assertAlmostEqual(r["totalReduction"], 40.0, places=2)
+        row = r["layers"][0]
+        self.assertEqual(row["wareWeight"], 100.0)
+        self.assertAlmostEqual(row["suggestedWeight"], 60.0, places=2)
+        self.assertEqual(row["overloadCount"], {"base": 2, "trial": 0})
+        self.assertEqual(r["metrics"]["overloadCount"], {"base": 2, "trial": 0})
+        self.assertEqual(r["remainingOverloads"], [])
+        # 重新整架校验：建议方案中所有有限容量柱都不超载
+        self.assertFalse(
+            any(p["overloaded"] for L in r["result"]["layers"] for p in L["posts"])
+        )
+        # 减载 40：台面载荷 200 → 160
+        self.assertEqual(r["metrics"]["carriedAtBottom"]["trial"], 160.0)
+
+    def test_relief_prefers_top_layer_ware(self):
+        # 顶层减量可同时满足顶层与底层约束时，最优解应把减量放在顶层
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 0,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 150},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 150},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 100, "y": 100, "w": 800, "d": 800, "weight": 80},
+                    "wareWeight": 320,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": 150},
+                        {"id": "D", "x": 800, "y": 800, "capacity": 150},
+                    ],
+                },
+            ],
+        }
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        # 顶层 T0=400 → 需减 100；底层 T0=500 → 后缀需 200；
+        # 顶层坯件余量充足，全部 200 都在顶层消化
+        self.assertAlmostEqual(r["totalReduction"], 200.0, places=2)
+        self.assertAlmostEqual(r["layers"][1]["reduction"], 200.0, places=2)
+        self.assertEqual(r["layers"][0]["reduction"], 0.0)
+        self.assertAlmostEqual(r["layers"][1]["suggestedWeight"], 120.0, places=2)
+
+    def test_relief_reduces_bottom_ware_when_top_exhausted(self):
+        # 顶层坯件仅 50 可减，底层约束还差减量 → 继续减底层坯件
+        # 顶层 T0=150，c=2 cap0 不约束；底层 T0=100+0+150=250，c=2 cap100 → T≤200 → 后缀需 50；
+        # 顶层坯件只有 50，减完正好。再构造顶层 cap70：顶层 T≤140 需减 10（50 足够），
+        # 底层仍只需总后缀 50。这里直接验证跨层分配：
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 100},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 100},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 100, "y": 100, "w": 800, "d": 800, "weight": 100},
+                    "wareWeight": 50,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": 0},
+                        {"id": "D", "x": 800, "y": 800, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        # T0_顶=150（不限容量）；T0_底=100+100+150=350，c=2 → T≤200，需后缀 150；
+        # 顶层坯件只能减 50 → 底层再减 100。
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        self.assertAlmostEqual(r["totalReduction"], 150.0, places=2)
+        self.assertAlmostEqual(r["layers"][1]["reduction"], 50.0, places=2)
+        self.assertAlmostEqual(r["layers"][0]["reduction"], 100.0, places=2)
+        self.assertEqual(r["layers"][0]["suggestedWeight"], 0.0)
+
+    def test_relief_infeasible_lists_remaining_overloads(self):
+        # 板自重 200、两根柱容量 40：清空全部坯件后每柱仍承 100 > 40 → 无解
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 200},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 40},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 40},
+                    ],
+                }
+            ],
+        }
+        r = relieve_load(state)
+        self.assertFalse(r["feasible"])
+        ids = {o["post"] for o in r["remainingOverloads"]}
+        self.assertEqual(ids, {"A", "B"})
+        for o in r["remainingOverloads"]:
+            self.assertEqual(o["load"], 100.0)
+            self.assertEqual(o["capacity"], 40.0)
+        # 无解时不给方案：建议重量保持原重量、各层减量与总减量均为 0
+        self.assertEqual(r["totalReduction"], 0.0)
+        self.assertEqual([row["reduction"] for row in r["layers"]], [0.0])
+        self.assertEqual(r["layers"][0]["suggestedWeight"], 100.0)
+
+    def test_relief_no_overload_returns_zero_reduction(self):
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [{"id": "A", "x": 100, "y": 100, "capacity": 400}],
+                }
+            ],
+        }
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 0.0)
+        self.assertEqual(r["layers"][0]["suggestedWeight"], 100.0)
+        self.assertEqual(r["metrics"]["overloadCount"], {"base": 0, "trial": 0})
+
+    def test_relief_unsupported_layer_breaks_chain(self):
+        # 中层无有效柱 → 顶层载荷在中层丢失；底层超载只能靠减底层坯件解决
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 80},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 80},
+                    ],
+                },
+                {
+                    "name": "中",
+                    "board": {"x": 100, "y": 100, "w": 800, "d": 800, "weight": 50},
+                    "wareWeight": 100,
+                    "posts": [],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 100, "y": 100, "w": 800, "d": 800, "weight": 50},
+                    "wareWeight": 300,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": 0},
+                        {"id": "D", "x": 800, "y": 800, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        # 底层 T0=200，c=2 cap80 → T≤160 → 减底层坯件 40；
+        # 中/顶层坯件对底层超载无贡献，不减少
+        self.assertAlmostEqual(r["totalReduction"], 40.0, places=2)
+        self.assertAlmostEqual(r["layers"][0]["reduction"], 40.0, places=2)
+        self.assertEqual(r["layers"][1]["reduction"], 0.0)
+        self.assertEqual(r["layers"][2]["reduction"], 0.0)
+        # 丢失载荷不因减载改变（中层依然无支撑，顶层载荷仍在该层丢失）
+        self.assertEqual(
+            r["metrics"]["lostLoad"]["base"], r["metrics"]["lostLoad"]["trial"]
+        )
+
+    def test_relief_unlimited_capacity_layer_needs_no_reduction_itself(self):
+        # 顶层全部不限容量：顶层自身无约束，减量只为满足底层；
+        # 若底层本身不超载，则总减量必须为 0（不能动顶层坯件）。
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 0,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 0},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 100, "y": 100, "w": 800, "d": 800, "weight": 80},
+                    "wareWeight": 320,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": 0},
+                        {"id": "D", "x": 800, "y": 800, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 0.0)
+
+    def test_relief_does_not_mutate_input(self):
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 40},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 40},
+                    ],
+                }
+            ],
+        }
+        before = json.loads(json.dumps(state, ensure_ascii=False))
+        relieve_load(state)
+        self.assertEqual(state, before)
+
+    def test_relief_sample_feasible_and_zero_overload_after(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        r = relieve_load(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["metrics"]["overloadCount"]["trial"], 0)
+        self.assertEqual(r["remainingOverloads"], [])
+        # 每层建议重量不超过原重量、不为负
+        for row in r["layers"]:
+            self.assertGreaterEqual(row["reduction"], 0.0)
+            self.assertLessEqual(row["suggestedWeight"], row["wareWeight"] + 1e-9)
+            self.assertGreaterEqual(row["suggestedWeight"], 0.0)
+            self.assertAlmostEqual(
+                row["wareWeight"] - row["suggestedWeight"],
+                row["reduction"],
+                places=1,
+            )
 
 
 if __name__ == "__main__":

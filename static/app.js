@@ -19,6 +19,16 @@ let recalcTimer = null;
 const topHit = [];       // 俯视图可点击热区
 const sideHit = [];      // 侧视图可点击热区
 
+/* ================= 减载配额试算状态 =================
+ * reliefData 只来自 POST /api/relieve（或离线兜底），绝不写盘；
+ * 仅当用户点「确认更新」后，才把建议坯件重量写回 state 走原有 PUT /api/state 保存。
+ * 减载预览与失效推演同时存在时，视图优先展示减载方案（reliefPreview）。
+ */
+let reliefData = null;       // 最近一次试算结果
+let reliefPreview = false;   // 是否正在俯视图/视图区预览减载方案
+let reliefSeq = 0;           // 试算请求序号，丢弃过期响应
+let reliefAppliedMsg = null; // 确认更新后的一次性提示
+
 /* ================= 加柱建议状态 =================
  * suggestData 只来自 POST /api/suggest 的试算结果（或离线兜底），绝不写盘；
  * 仅当用户在预览中点「确认加柱」后，才把新柱追加进 state 走原有 PUT /api/state 保存。
@@ -34,7 +44,7 @@ const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
 const r2 = (v) => Math.round(v * 100) / 100;
-const viewResult = () => simulation || result; // 当前展示用结果：推演进行中为推演值，否则为基准
+const viewResult = () => (reliefPreview && reliefData ? reliefData.result : simulation) || result; // 展示用结果：减载预览优先于推演，否则基准
 const debounce = (fn, ms) => (...args) => {
   clearTimeout(recalcTimer);
   recalcTimer = setTimeout(() => fn(...args), ms);
@@ -81,12 +91,14 @@ function collectState() {
 }
 
 /* ================= 重算 + 保存 + 渲染 ================= */
-async function recalcAndRender(applySuggestion) {
+async function recalcAndRender(applySuggestion, applyRelief) {
   const payload = collectState();
-  setSaveState("saving", applySuggestion ? "写入新柱并保存中…" : "重算并保存中…");
-  // 架体一经编辑/写盘，之前的加柱试算结果即作废（确认写入的那次除外）
+  setSaveState("saving", applySuggestion ? "写入新柱并保存中…" : applyRelief ? "按建议重量更新并保存中…" : "重算并保存中…");
+  // 架体一经编辑/写盘，之前的试算结果即作废（确认写入的那次除外）
   if (!applySuggestion) invalidateSuggestions({ silent: true });
+  if (!applyRelief) invalidateRelief({ silent: true });
   suggestAppliedMsg = null;
+  reliefAppliedMsg = null;
   try {
     const res = await fetch("/api/state", {
       method: "PUT",
@@ -99,10 +111,19 @@ async function recalcAndRender(applySuggestion) {
     state = payload;
     setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
     if (applySuggestion) suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
+    if (applyRelief) {
+      reliefAppliedMsg = "✓ 坯件重量已按建议更新并触发自动保存";
+      // 方案已落实：清掉试算态（reload 后的新基准即方案结果）
+      reliefData = null; reliefPreview = false; reliefSeq++;
+    }
   } catch (err) {
     setSaveState("error", "保存失败，仅本地重算");
     result = calculateLocal(payload);
     if (applySuggestion) suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
+    if (applyRelief) {
+      reliefAppliedMsg = "✓ 坯件重量已按建议更新到本地编辑（后端不可用，未能保存）";
+      reliefData = null; reliefPreview = false; reliefSeq++;
+    }
   }
   selection = selection && stillExists(selection) ? selection : null;
   // 编辑只更新基准；若正在推演，用同一失效选择在新基准上重跑（失效标记不保存）
@@ -338,7 +359,9 @@ $("#btnReset").addEventListener("click", async () => {
   selection = null;
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
+  invalidateRelief({ silent: true });
   suggestAppliedMsg = null;
+  reliefAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
   setSaveState("saved", "✓ 已恢复示例 " + new Date().toLocaleTimeString("zh-CN"));
 });
@@ -361,6 +384,7 @@ function renderResults() {
   renderSimPanel();
   renderSuggestOptions();
   renderSuggestPanel();
+  renderReliefPanel();
 }
 
 function renderTotals() {
@@ -370,6 +394,7 @@ function renderTotals() {
   const errs = issues.filter((x) => x.level === "error").length;
   const warns = issues.filter((x) => x.level === "warn").length;
   $("#totals").innerHTML = `
+    ${reliefPreview && reliefData ? `<div class="stat relief"><div class="k">减载预览中</div><div class="v">⚖️ ${fmt(reliefData.totalReduction)}<small> kg 总减量</small></div></div>` : ""}
     ${simulation ? `<div class="stat sim"><div class="k">失效推演中</div><div class="v">🔮 ${failedSelection.length}<small> 根立柱失效</small></div></div>` : ""}
     <div class="stat"><div class="k">层数</div><div class="v">${t.layerCount}<small> 层</small></div></div>
     <div class="stat"><div class="k">立柱总数</div><div class="v">${t.postCount}<small> 根</small></div></div>
@@ -1262,6 +1287,215 @@ $("#btnConfirmSuggest").addEventListener("click", confirmSuggestPlan);
   if (el) el.addEventListener("change", () => { suggestAppliedMsg = null; renderSuggestPanel(); });
 });
 
+/* ================= 减载配额试算面板 ================= */
+/* 架体发生编辑/重置：上次减载方案作废（不影响已确认保存的数据） */
+function invalidateRelief(opts) {
+  reliefData = null;
+  reliefPreview = false;
+  reliefSeq++;
+  if (!opts || !opts.silent) renderReliefPanel();
+}
+
+async function runRelief() {
+  if (!state) return;
+  const status = $("#reliefStatus");
+  reliefAppliedMsg = null;
+  status.textContent = "试算中…";
+  status.className = "badge has-relief";
+  const seq = ++reliefSeq;
+  let data;
+  try {
+    const res = await fetch("/api/relieve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== reliefSeq) return;
+      reliefData = null; reliefPreview = false;
+      renderReliefPanel((data && data.error) || `试算失败（HTTP ${res.status}）`);
+      return;
+    }
+  } catch (e) {
+    try {
+      data = reliefLocal(state); // 离线兜底：与后端同一套算法
+    } catch (e2) {
+      if (seq !== reliefSeq) return;
+      reliefData = null; reliefPreview = false;
+      renderReliefPanel(e2.message);
+      return;
+    }
+  }
+  if (seq !== reliefSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  reliefData = data;
+  // 有可行方案才进入预览；无解方案只展示剩余超载柱，不切换视图
+  reliefPreview = !!data.feasible;
+  renderReliefPanel();
+  drawTop(); drawSide();
+}
+
+function cancelReliefPreview() {
+  // 取消预览：仅恢复基准视图，试算结果保留可再次确认；绝不改动架体数据
+  reliefPreview = false;
+  renderReliefPanel();
+  drawTop(); drawSide();
+}
+
+async function confirmReliefPlan() {
+  if (!reliefData || !reliefData.feasible) return;
+  const rows = reliefData.layers;
+  const changed = rows.filter((r) => r.reduction > 0);
+  const summary = changed
+    .map((r) => `${r.name}：${fmt(r.wareWeight)} → ${fmt(r.suggestedWeight)} kg`)
+    .join("\n");
+  if (!confirm(`按建议重量更新 ${changed.length} 个层的坯件重量（总减量 ${fmt(reliefData.totalReduction)} kg）？\n\n${summary}\n\n确认后将写入架体并自动保存。`)) return;
+  // 确认后才写入：仅改坯件重量 → 走原有编辑通道（PUT /api/state）触发自动保存
+  rows.forEach((r) => {
+    if (state.layers[r.layer]) state.layers[r.layer].wareWeight = r.suggestedWeight;
+  });
+  renderEditor();
+  await recalcAndRender(false, true);
+  renderReliefPanel();
+}
+
+function renderReliefPanel(errText) {
+  const out = $("#reliefOutput");
+  const status = $("#reliefStatus");
+  const btnCancel = $("#btnCancelRelief");
+  const btnConfirm = $("#btnConfirmRelief");
+  if (!out) return;
+  btnCancel.disabled = !reliefPreview;
+  btnConfirm.disabled = !(reliefPreview && reliefData && reliefData.feasible);
+
+  if (reliefAppliedMsg) {
+    status.textContent = "已更新";
+    status.className = "badge has-relief";
+  } else if (!reliefData) {
+    status.textContent = errText ? "试算失败" : "未试算";
+    status.className = "badge";
+  } else if (!reliefData.feasible) {
+    status.textContent = "无解";
+    status.className = "badge has-error";
+  } else if (reliefPreview) {
+    status.textContent = "预览中";
+    status.className = "badge has-relief";
+  } else {
+    status.textContent = "已取消预览";
+    status.className = "badge";
+  }
+
+  if (reliefAppliedMsg) {
+    out.innerHTML = `<p class="sug-applied relief-applied">${escapeHtml(reliefAppliedMsg)}</p>`;
+    return;
+  }
+  if (errText) {
+    out.innerHTML = `<p class="sug-error">⚠ ${escapeHtml(errText)}</p>`;
+    return;
+  }
+  if (!reliefData) {
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">点击「开始试算」，后端以当前架体为基准，只调各层坯件重量，按现有整架分摊规则求消除全部有限容量柱超载的最小总减载量，并对方案重新整架校验。试算不写入状态；确认后才更新坯件重量并自动保存。</p>`;
+    return;
+  }
+
+  const m = reliefData.metrics;
+  const rows = reliefData.layers.map((r) => {
+    const totD = r.loadTotal.trial - r.loadTotal.base;
+    const lostD = r.lostLoad.trial - r.lostLoad.base;
+    const carD = r.loadCarried.trial - r.loadCarried.base;
+    const ovD = r.overloadCount.trial - r.overloadCount.base;
+    const cell = (base, trial, d, goodDown) => {
+      const cls = Math.abs(d) < 1e-9 ? "" : (goodDown ? (d < 0 ? "down" : "up2") : (d > 0 ? "down" : "up2"));
+      return `<td>${fmt(base)} → <b>${fmt(trial)}</b> <span class="${cls}">${Math.abs(d) < 1e-9 ? "" : (d > 0 ? "+" : "") + fmt(d)}</span></td>`;
+    };
+    return `<tr${r.reduction > 0 ? ' class="target"' : ""}>
+      <td>${escapeHtml(r.name)}</td>
+      <td>${fmt(r.wareWeight)}</td>
+      <td><b>${fmt(r.suggestedWeight)}</b></td>
+      <td class="${r.reduction > 0 ? "down" : ""}">−${fmt(r.reduction)}</td>
+      ${cell(r.loadTotal.base, r.loadTotal.trial, totD, false)}
+      ${cell(r.lostLoad.base, r.lostLoad.trial, lostD, true)}
+      ${cell(r.loadCarried.base, r.loadCarried.trial, carD, false)}
+      ${cell(r.overloadCount.base, r.overloadCount.trial, ovD, true)}
+    </tr>`;
+  }).join("");
+
+  const metricBox = (label, pair, unit, goodDown) => {
+    const d = pair.trial - pair.base;
+    const good = Math.abs(d) < 1e-9 ? "" : (goodDown ? (d < 0 ? "good" : "bad") : "");
+    return `<div class="sug-metric ${good}"><span>${label}</span><b>${fmt(pair.base)} → ${fmt(pair.trial)}</b><small>${unit}${Math.abs(d) < 1e-9 ? "（不变）" : (d > 0 ? "，+" : "，−") + fmt(Math.abs(d))}</small></div>`;
+  };
+
+  if (!reliefData.feasible) {
+    const remainHtml = reliefData.remainingOverloads.length
+      ? reliefData.remainingOverloads.map((o) =>
+          `<li class="error is-added" data-layer="${o.layer}" data-post="${encodeURIComponent(o.post)}">
+             <span class="itype">超载</span><span>${escapeHtml(o.message)}</span></li>`).join("")
+      : `<li class="muted" style="cursor:default">（未返回明细）</li>`;
+    out.innerHTML = `
+      <p class="sug-error">🚫 无解：即使把全部层坯件清空（共减 ${fmt(reliefData.layers.reduce((s, r) => s + r.wareWeight, 0))} kg），
+        仍有 <b>${reliefData.remainingOverloads.length}</b> 根有限容量立柱超载。请考虑加柱 / 更换大容量柱 / 减轻棚板自重。</p>
+      <p class="hint" style="margin:8px 0 2px">下表「假设清空坯件」列给出的是<b>全部坯件减为 0</b> 的假想整架结果（仅用于说明仍超载的程度，不是可执行方案；确认按钮已禁用）。</p>
+      <div class="sug-table-wrap">
+        <table class="src-table sug-table relief-table">
+          <tr class="head"><td>层</td><td>原坯重 kg</td><td>假设清空 kg</td><td>本层总载荷 kg（现→清空后）</td>
+            <td>丢失 kg</td><td>下传 kg</td><td>超载柱</td></tr>
+          ${reliefData.layers.map((r) => `
+            <tr>
+              <td>${escapeHtml(r.name)}</td>
+              <td>${fmt(r.wareWeight)}</td>
+              <td><b>0</b></td>
+              <td>${fmt(r.loadTotal.base)} → <b>${fmt(r.loadTotal.trial)}</b></td>
+              <td>${fmt(r.lostLoad.base)} → <b>${fmt(r.lostLoad.trial)}</b></td>
+              <td>${fmt(r.loadCarried.base)} → <b>${fmt(r.loadCarried.trial)}</b></td>
+              <td>${r.overloadCount.base} → <b class="${r.overloadCount.trial ? "up2" : ""}">${r.overloadCount.trial}</b></td>
+            </tr>`).join("")}
+        </table>
+      </div>
+      <div class="sub-title" style="color:var(--error)">全部坯件清空后的剩余超载柱</div>
+      <ul class="sug-issues">${remainHtml}</ul>`;
+    } else {
+    const zeroNote = reliefData.totalReduction <= 0
+      ? `<p class="sug-applied relief-ok">✓ 当前架体本就没有有限容量立柱超载，无需减载。</p>` : "";
+    out.innerHTML = `
+      ${zeroNote}
+      <div class="sug-metrics relief-metrics">
+        <div class="sug-metric ${m.overloadCount.trial < m.overloadCount.base ? "good" : ""}"><span>超载柱数</span><b>${m.overloadCount.base} → ${m.overloadCount.trial}</b><small>根</small></div>
+        <div class="sug-metric"><span>最小总减载量</span><b>${fmt(reliefData.totalReduction)}</b><small>kg（坯件）</small></div>
+        ${metricBox("传到台面", m.carriedAtBottom, "kg", false)}
+        ${metricBox("丢失载荷", m.lostLoad, "kg", true)}
+        ${metricBox("架体总自重(板+坯)", m.ownWeight, "kg", false)}
+      </div>
+      <div class="sug-table-wrap">
+        <table class="src-table sug-table relief-table">
+          <tr class="head"><td>层</td><td>原坯件重量 kg</td><td>建议重量 kg</td><td>减量</td>
+            <td>本层总载荷 kg</td><td>丢失载荷 kg</td><td>下传载荷 kg</td><td>超载柱</td></tr>
+          ${rows}
+        </table>
+      </div>
+      <p class="muted" style="margin:6px 0 0">
+        ${reliefPreview
+          ? "俯视图 / 侧视图正以减载后的整架重校结果预览；点「✕ 取消预览」恢复基准，点「✓ 确认按建议重量更新并保存」才会写入。"
+          : "预览已取消（基准结果）；试算结果仍保留，可直接点「✓ 确认按建议重量更新并保存」，或重新试算。"}
+        继续编辑架体会使本方案自动作废。
+      </p>`;
+  }
+
+  // 剩余超载柱 / 对比表条目可点击定位
+  out.querySelectorAll("[data-layer]").forEach((li) => {
+    li.addEventListener("click", () => {
+      const layer = +li.dataset.layer;
+      const post = li.dataset.post ? decodeURIComponent(li.dataset.post) : "";
+      selection = post ? { kind: "post", layer, post } : { kind: "board", layer };
+      renderDetail(); drawTop(); drawSide();
+    });
+  });
+}
+
+$("#btnRelief").addEventListener("click", runRelief);
+$("#btnCancelRelief").addEventListener("click", cancelReliefPreview);
+$("#btnConfirmRelief").addEventListener("click", confirmReliefPlan);
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -1638,4 +1872,152 @@ function suggestLocal(rawState, layer, spacing, capacity) {
     },
     plans, reason: null, toleranceMm: TOL_MM,
   };
+}
+
+/* ======================================================================
+ * 减载配额试算离线兜底：与 app/calc.py 的 relieve_load 对齐（只算不存）
+ * ==================================================================== */
+function reliefLocal(rawState) {
+  // 显式构造一份可安全深改的规范化输入（calculateLocal 内部也做同样的宽容规范化）
+  const norm = (() => {
+    const car = {
+      name: (rawState.car && rawState.car.name) || "窑车台面",
+      w: Math.max(0, num(rawState.car && rawState.car.w)),
+      d: Math.max(0, num(rawState.car && rawState.car.d)),
+    };
+    const layers = (rawState.layers || []).map((l0, idx) => {
+      const b0 = l0.board || {};
+      return {
+        id: l0.id || "L" + idx,
+        name: l0.name || "第" + (idx + 1) + "层",
+        height: Math.max(0, num(l0.height)),
+        board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+        wareWeight: Math.max(0, num(l0.wareWeight)),
+        posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+      };
+    });
+    return { car, layers };
+  })();
+  const n = norm.layers.length;
+  const EPS = 1e-9;
+
+  const inRect = (x, y, rc) => x >= rc.x - 1e-9 && x <= rc.x + rc.w + 1e-9 && y >= rc.y - 1e-9 && y <= rc.y + rc.d + 1e-9;
+  const supportRect = (i) => i === 0
+    ? { x: 0, y: 0, w: norm.car.w, d: norm.car.d }
+    : { x: norm.layers[i - 1].board.x, y: norm.layers[i - 1].board.y, w: norm.layers[i - 1].board.w, d: norm.layers[i - 1].board.d };
+  const effectivePosts = (i) => norm.layers[i].posts.filter((p) => inRect(p.x, p.y, supportRect(i)));
+
+  const counts = norm.layers.map((_, i) => effectivePosts(i).length);
+  const minCaps = norm.layers.map((_, i) => {
+    const caps = effectivePosts(i).map((p) => p.capacity).filter((c) => c > 0);
+    return caps.length ? Math.min(...caps) : null;
+  });
+  // 精确（不做两位截断）的基准各层总载荷 T0
+  const totals = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    const L = norm.layers[i];
+    let t = L.board.weight + L.wareWeight;
+    if (i < n - 1 && counts[i + 1] > 0) t += totals[i + 1];
+    totals[i] = t;
+  }
+
+  const baseline = calculateLocal(norm);
+  const countOver = (res) => res.layers.reduce((s, L) => s + L.posts.filter((p) => p.overloaded).length, 0);
+  const overPosts = (res) => {
+    const out = [];
+    res.layers.forEach((L) => L.posts.forEach((p) => {
+      if (p.overloaded) out.push({ layer: L.index, layerName: L.name, post: p.id, load: p.load, capacity: p.capacity,
+        message: `${L.name} 立柱 ${p.id} 仍超载：载荷 ${p.load} kg > 容量 ${p.capacity} kg` });
+    }));
+    return out;
+  };
+  const pairOf = (b, t) => ({ base: b, trial: t, delta: r2(t - b) });
+
+  const payload = (trial, suggested, reductions, feasible, remaining) => {
+    const rows = norm.layers.map((L, i) => {
+      const bL = baseline.layers[i], tL = trial.layers[i];
+      const bOv = bL.posts.filter((p) => p.overloaded).length;
+      const tOv = tL.posts.filter((p) => p.overloaded).length;
+      return {
+        layer: i, name: L.name,
+        wareWeight: r2(L.wareWeight), suggestedWeight: r2(suggested[i]), reduction: r2(reductions[i]),
+        loadTotal: { base: bL.loadTotal, trial: tL.loadTotal },
+        lostLoad: { base: bL.lostLoad, trial: tL.lostLoad },
+        loadCarried: { base: bL.loadCarried, trial: tL.loadCarried },
+        overloadCount: { base: bOv, trial: tOv },
+      };
+    });
+    return {
+      ok: true, feasible, layers: rows, totalReduction: r2(reductions.reduce((s, v) => s + v, 0)),
+      metrics: {
+        overloadCount: { base: countOver(baseline), trial: countOver(trial) },
+        lostLoad: pairOf(baseline.totals.lostLoad, trial.totals.lostLoad),
+        carriedAtBottom: pairOf(baseline.totals.carriedAtBottom, trial.totals.carriedAtBottom),
+        ownWeight: pairOf(baseline.totals.ownWeight, trial.totals.ownWeight),
+      },
+      remainingOverloads: remaining, baseline, result: trial,
+    };
+  };
+
+  if (countOver(baseline) === 0) {
+    const same = norm.layers.map((L) => L.wareWeight);
+    return payload(baseline, same, new Array(n).fill(0), true, []);
+  }
+
+  // 自上而下贪心：同链后缀减量优先放到最高层
+  const reductions = new Array(n).fill(0);
+  const remainingCap = norm.layers.map((L) => L.wareWeight);
+  let chainTop = n - 1;
+  let suffix = 0;
+  let blocked = null;
+  for (let i = n - 1; i >= 0; i--) {
+    if (counts[i] === 0) { chainTop = i - 1; suffix = 0; continue; }
+    const m = minCaps[i];
+    if (m !== null) {
+      let need = totals[i] - counts[i] * m - suffix;
+      if (need > EPS) {
+        for (let j = chainTop; j >= i; j--) {
+          const use = Math.min(remainingCap[j], need);
+          if (use > 0) { reductions[j] += use; remainingCap[j] -= use; suffix += use; need -= use; }
+          if (need <= EPS) break;
+        }
+        if (need > EPS && blocked === null) blocked = i;
+      }
+    }
+  }
+
+  const ware0 = norm.layers.map((L) => L.wareWeight);
+  if (blocked !== null) {
+    // 全清空试算：无解，列出剩余超载柱；建议重量保持原重量、减量 0
+    const zeroState = JSON.parse(JSON.stringify(norm));
+    zeroState.layers.forEach((L) => { L.wareWeight = 0; });
+    const zeroTrial = calculateLocal(zeroState);
+    return payload(zeroTrial, ware0, new Array(n).fill(0), false, overPosts(zeroTrial));
+  }
+
+  // 建议重量 0.01 kg 向下取整后整架校验，取整残差自超载最高层起每次再减 0.01
+  const suggested = ware0.map((w, i) => reductions[i] <= EPS
+    ? w : Math.max(0, Math.floor((w - reductions[i]) * 100 + 1e-6) / 100));
+  const trialState = JSON.parse(JSON.stringify(norm));
+  trialState.layers.forEach((L, i) => { L.wareWeight = suggested[i]; });
+  let trial;
+  for (let iter = 0; iter < 10000; iter++) {
+    trial = calculateLocal(trialState);
+    const overLayers = trial.layers.filter((L) => L.posts.some((p) => p.overloaded)).map((L) => L.index);
+    if (!overLayers.length) break;
+    // 只在超载最高层所在的有效柱链内向更高层找（不支撑层之上传不到这里）
+    const topOver = Math.max(...overLayers);
+    let chainTop = topOver;
+    while (chainTop + 1 < n && counts[chainTop + 1] > 0) chainTop++;
+    let target = -1;
+    for (let j = chainTop; j >= topOver; j--) {
+      if (trialState.layers[j].wareWeight >= 0.01 - 1e-9) { target = j; break; }
+    }
+    if (target < 0) break; // 安全阀：精确贪心已判定可行，正常不会到这
+    trialState.layers[target].wareWeight = r2(trialState.layers[target].wareWeight - 0.01);
+    suggested[target] = trialState.layers[target].wareWeight;
+  }
+  trial = calculateLocal(trialState);
+  const actual = ware0.map((w, i) => w - suggested[i]);
+  return payload(trial, suggested, actual, overPosts(trial).length === 0, overPosts(trial));
 }

@@ -121,6 +121,28 @@
         <div id="suggestOutput"></div>
       </div>
 
+      <div class="panel relief-panel">
+        <div class="sim-head">
+          <h2>⚖️ 减载配额试算 <span id="reliefStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelRelief" class="btn btn-ghost" type="button" disabled>✕ 取消预览（不改数据）</button>
+            <button id="btnConfirmRelief" class="btn btn-confirm" type="button" disabled>✓ 确认按建议重量更新并保存</button>
+          </div>
+        </div>
+        <p class="hint">
+          以当前架体为基准，<b>只调整各层坯件重量</b>（棚板、立柱、坐标均不变），在每层减量不超过现有坯件重量的
+          条件下，求让所有<b>有限容量立柱</b>（容量 0=不限，不参与）不再超载的<b>最小总减载量</b>；
+          多层载荷按现有整架分摊规则共同传到下层，求得方案后会再做一次整架校验。
+          试算<span class="hl">不写入状态</span>；点击「开始试算」预览各层原重量 → 建议重量与减载前后超载数、
+          丢失载荷对比，确认后才更新坯件重量并沿用自动保存；架体一经编辑，旧方案立即作废。
+          若全部坯件清空仍有超载，会明确给出<b>无解</b>并列出剩余超载柱。
+        </p>
+        <div class="relief-form">
+          <button id="btnRelief" class="btn btn-run btn-relief-run" type="button">开始试算</button>
+        </div>
+        <div id="reliefOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>

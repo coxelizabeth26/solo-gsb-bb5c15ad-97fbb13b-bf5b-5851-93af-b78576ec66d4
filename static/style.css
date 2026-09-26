@@ -12,6 +12,7 @@
   --hang: #c061e8;
   --overlap: #ff8c42;
   --failed: #ff5c8a;
+  --relief: #3fd6d6;
 }
 
 * { box-sizing: border-box; }
@@ -322,6 +323,23 @@ ul.sug-issues li .itype { flex: 0 0 30px; font-size: 10px; }
 ul.sug-issues li.is-added .itype { color: var(--error); }
 ul.sug-issues li.is-removed .itype { color: var(--normal); }
 
+/* ---------- 减载配额试算 ---------- */
+.relief-panel { border-style: dashed; border-color: #1f6f78; }
+.badge.has-relief { color: var(--relief, #3fd6d6); border-color: var(--relief, #3fd6d6); }
+.stat.relief { border-color: var(--relief, #3fd6d6); }
+.stat.relief .v { color: var(--relief, #3fd6d6); font-size: 16px; }
+.relief-form { display: flex; justify-content: flex-end; margin-top: 8px; }
+.btn-relief-run { border-color: var(--relief, #3fd6d6); color: var(--relief, #3fd6d6); }
+.btn-relief-run:hover { background: rgba(63, 214, 214, 0.12); }
+.relief-metrics { grid-template-columns: repeat(5, 1fr); }
+.relief-applied, .relief-ok {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: 7px; font-size: 12px;
+  background: rgba(63, 214, 214, 0.12); border: 1px solid var(--relief, #3fd6d6); color: var(--relief, #3fd6d6);
+}
+.relief-table tr.target td { color: var(--relief, #3fd6d6); }
+.relief-table td span.down { color: var(--normal); }
+.relief-table td span.up2 { color: var(--error); }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }
@@ -329,5 +347,6 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
   .sim-cols { grid-template-columns: 1fr; }
   .suggest-form { grid-template-columns: 1fr 1fr; }
   .sug-metrics { grid-template-columns: 1fr 1fr; }
+  .relief-metrics { grid-template-columns: 1fr 1fr; }
   .sug-issue-cols { grid-template-columns: 1fr; }
 }

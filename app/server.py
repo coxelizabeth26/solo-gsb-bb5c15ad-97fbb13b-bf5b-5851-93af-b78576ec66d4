@@ -12,6 +12,10 @@ POST /api/simulate   立柱失效推演：body {"state": 架体JSON(可省), "fa
 POST /api/suggest    加柱建议：body {"state"(可省), "layer": 0, "spacing": 200, "capacity": 300}，
                      在目标层承托面内按候选网格逐点试算新增一根立柱，返回前 5 个方案；
                      只计算，不写盘；用户确认后由前端走 PUT /api/state 正式写入
+POST /api/relieve    减载配额试算：body {"state": 架体JSON(可省)}，
+                     只调各层坯件重量求消除全部超载柱的最小总减载量，
+                     返回逐层原重量/建议重量/减量与减载前后对比、整架重校结果；
+                     只计算，不写盘；确认更新由前端走 PUT /api/state 完成
 POST /api/reset      恢复内置示例数据
 """
 
@@ -23,7 +27,7 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, simulate, suggest_posts
+from .calc import calculate, relieve_load, simulate, suggest_posts
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -135,6 +139,17 @@ def api_suggest():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/relieve", methods=["POST"])
+def api_relieve():
+    """减载配额试算：只调坯件重量、最小总减量消除全部超载。只算不写盘。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    return jsonify({"ok": True, **relieve_load(state)})
 
 
 if __name__ == "__main__":

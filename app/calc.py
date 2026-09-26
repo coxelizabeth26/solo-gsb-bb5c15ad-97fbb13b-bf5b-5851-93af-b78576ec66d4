@@ -763,6 +763,18 @@ def _max_utilization(res: Dict[str, Any]) -> Optional[float]:
     return best
 
 
+# --------------------------------------------------------------------------
+# 减载配额试算（Relief Quota）：只调整各层坯件重量，求消除全部超载的最小总减载
+# --------------------------------------------------------------------------
+def _effective_posts(norm: Dict[str, Any], i: int) -> List[Dict[str, Any]]:
+    """第 i 层的有效立柱（底端落在承托面矩形内；与 _calculate 的悬空判定一致）。"""
+    return [
+        p
+        for p in norm["layers"][i]["posts"]
+        if in_rect(p["x"], p["y"], _support_rect_for(norm, i))
+    ]
+
+
 def _layer_rows(base: Dict[str, Any], trial: Dict[str, Any]) -> List[Dict[str, Any]]:
     """逐层载荷对比：本层总载荷 / 丢失载荷 / 下传载荷 / 超载柱数。"""
     rows: List[Dict[str, Any]] = []
@@ -1029,3 +1041,284 @@ def suggest_posts(
         "reason": None,
         "toleranceMm": TOL_MM,
     }
+
+
+# --------------------------------------------------------------------------
+# 减载配额试算（Relief Quota）：只调坯件重量，求消除全部超载柱的最小总减载
+# --------------------------------------------------------------------------
+# 关键线性性质（刚性棚板、有效柱均摊）：
+#   * 同层每根有效柱载荷恒为 T_i / c_i（与上层点载荷落点/重叠无关，落点只影响
+#     下传点的合并方式，不改变下传总量）；
+#   * 第 i 层棚板总载荷 T_i = 板重_i + 坯重_i + 上一层下传量；
+#     上一层无有效柱（不支撑）时载荷整层丢失、下传量为 0；
+#   * 因此沿“有效柱链”自上而下，T_i 对各层坯件减量是后缀线性和：
+#       T_i(d) = T0_i - Σ_{j≥i, 同链} d_j
+#   * 第 i 层有限容量柱全部不超载 ⇔ T_i ≤ c_i · m_i（m_i=该层最小正容量）；
+#     该层没有有限容量柱则不形成约束（容量 0 = 不限）。
+# 于是问题是一组嵌套的后缀和约束：把所需减量自上而下优先放到尽可能高的层
+# （高层减量能同时满足自身及下方所有约束），即可得到最小总减载量。
+RELIEF_EPS = 1e-9
+RELIEF_FLOOR_STEP = 0.01  # 建议坯件重量按 0.01 kg 向下取整后再整架校验
+RELIEF_FIX_MAX_ITERS = 10000
+
+
+def _baseline_layer_totals(norm: Dict[str, Any]) -> List[float]:
+    """精确（不做两位截断）的各层基准总载荷 T0_i。
+
+    下传总量只取决于上一层是否有效支撑：有则等于 T0_{i+1}，无则整层丢失为 0。
+    """
+    layers = norm["layers"]
+    n = len(layers)
+    counts = [len(_effective_posts(norm, i)) for i in range(n)]
+    totals = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        L = layers[i]
+        t = L["board"]["weight"] + L["wareWeight"]
+        if i < n - 1 and counts[i + 1] > 0:
+            t += totals[i + 1]
+        totals[i] = t
+    return totals
+
+
+def _relief_greedy(
+    norm: Dict[str, Any],
+) -> Tuple[List[float], Optional[int]]:
+    """自上而下贪心求最小总减量。
+
+    返回 (reductions, blocked_layer)：
+      reductions[i] 为第 i 层建议坯件减量；
+      blocked_layer 为首个无法满足的约束层（None=全部可满足）。
+    """
+    layers = norm["layers"]
+    n = len(layers)
+    counts = [len(_effective_posts(norm, i)) for i in range(n)]
+    min_caps: List[Optional[float]] = []
+    for i in range(n):
+        caps = [p["capacity"] for p in _effective_posts(norm, i) if p["capacity"] > 0]
+        min_caps.append(min(caps) if caps else None)
+
+    totals = _baseline_layer_totals(norm)
+    reductions = [0.0] * n
+    remaining = [L["wareWeight"] for L in layers]
+
+    chain_top = n - 1   # 当前“有效柱链”最高层索引（遇不支撑层断开）
+    suffix = 0.0        # 已放置在本层以上、同链各层的减量和
+    blocked_layer: Optional[int] = None
+
+    for i in range(n - 1, -1, -1):
+        if counts[i] == 0:
+            # 不支撑层：载荷整层丢失、不向下传，链在此断开；
+            # 该层坯件减不减都救不了任何超载柱，保持原样（总量最小）。
+            chain_top = i - 1
+            suffix = 0.0
+            continue
+
+        m = min_caps[i]
+        if m is not None:
+            rhs = totals[i] - counts[i] * m  # 本链后缀减量至少要达到的值
+            need = rhs - suffix
+            if need > RELIEF_EPS:
+                # 优先消耗链内最高层的坯件余量（高层减量对约束的“覆盖面”最大）
+                for j in range(chain_top, i - 1, -1):
+                    use = min(remaining[j], need)
+                    if use > 0:
+                        reductions[j] += use
+                        remaining[j] -= use
+                        suffix += use
+                        need -= use
+                    if need <= RELIEF_EPS:
+                        break
+                if need > RELIEF_EPS and blocked_layer is None:
+                    blocked_layer = i
+        # 本层及以上链内的减量，对下一层同样计入后缀和
+    return reductions, blocked_layer
+
+
+def _overloaded_posts(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for L in res["layers"]:
+        for p in L["posts"]:
+            if p.get("overloaded"):
+                out.append(
+                    {
+                        "layer": L["index"],
+                        "layerName": L["name"],
+                        "post": p["id"],
+                        "load": p["load"],
+                        "capacity": p["capacity"],
+                        "message": (
+                            f"{L['name']} 立柱 {p['id']} 仍超载："
+                            f"载荷 {p['load']} kg > 容量 {p['capacity']} kg"
+                        ),
+                    }
+                )
+    return out
+
+
+def _relief_layer_rows(
+    norm: Dict[str, Any],
+    base: Dict[str, Any],
+    trial: Dict[str, Any],
+    suggested: List[float],
+    reductions: List[float],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for i, L in enumerate(norm["layers"]):
+        bL, tL = base["layers"][i], trial["layers"][i]
+        b_ov = sum(1 for p in bL["posts"] if p.get("overloaded"))
+        t_ov = sum(1 for p in tL["posts"] if p.get("overloaded"))
+        rows.append(
+            {
+                "layer": i,
+                "name": L["name"],
+                "wareWeight": r2(L["wareWeight"]),
+                "suggestedWeight": r2(suggested[i]),
+                "reduction": r2(reductions[i]),
+                "loadTotal": {"base": bL["loadTotal"], "trial": tL["loadTotal"]},
+                "lostLoad": {"base": bL["lostLoad"], "trial": tL["lostLoad"]},
+                "loadCarried": {"base": bL["loadCarried"], "trial": tL["loadCarried"]},
+                "overloadCount": {"base": b_ov, "trial": t_ov},
+            }
+        )
+    return rows
+
+
+def _relief_payload(
+    norm: Dict[str, Any],
+    baseline: Dict[str, Any],
+    trial: Dict[str, Any],
+    suggested: List[float],
+    reductions: List[float],
+    feasible: bool,
+    remaining: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    def pair(key: str) -> Dict[str, float]:
+        b = baseline["totals"][key]
+        t = trial["totals"][key]
+        return {"base": b, "trial": t, "delta": r2(t - b)}
+
+    base_over = _count_overloaded(baseline)
+    trial_over = _count_overloaded(trial)
+    return {
+        "feasible": feasible,
+        "layers": _relief_layer_rows(norm, baseline, trial, suggested, reductions),
+        "totalReduction": r2(sum(reductions)),
+        "metrics": {
+            "overloadCount": {"base": base_over, "trial": trial_over},
+            "lostLoad": pair("lostLoad"),
+            "carriedAtBottom": pair("carriedAtBottom"),
+            "ownWeight": pair("ownWeight"),
+        },
+        "remainingOverloads": remaining,
+        "baseline": baseline,
+        "result": trial,
+    }
+
+
+def relieve_load(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """减载配额试算：只调整各层坯件重量，求使所有有限容量立柱不再超载的
+    **最小总减载量**；多层载荷按现有整架分摊规则共同传到下层。
+
+    约束与边界
+    ----------
+    * 仅允许调小坯件重量：每层减量 0 ≤ d_i ≤ 现有坯件重量（板重/立柱/坐标不动）；
+    * 不支撑层（无有效柱）载荷整层丢失，其坯件减量无法缓解任何超载柱，
+      最优方案中保持原样；
+    * 用后缀线性约束贪心得到最小减量后，建议重量按 0.01 kg 向下取整，并对
+      方案**重新整架校验**（同一套 calculate），若有取整残留则每次自超载
+      最高层起再减 0.01 kg 直至零超载；
+    * 若全部坯件清空（d_i = 现有坯件重量）仍有超载柱，返回 feasible=False
+      及剩余超载柱清单，本试算不修改输入、不写盘。
+    """
+    import copy
+
+    norm = normalize(raw_state)
+    n = len(norm["layers"])
+    baseline = _calculate(norm)
+
+    if _count_overloaded(baseline) == 0:
+        # 基准已无超载：无需减载
+        same = [L["wareWeight"] for L in norm["layers"]]
+        zero = [0.0] * n
+        return _relief_payload(
+            norm, baseline, baseline, same, zero, True, []
+        )
+
+    reductions, blocked_layer = _relief_greedy(norm)
+    ware0 = [L["wareWeight"] for L in norm["layers"]]
+
+    if blocked_layer is not None:
+        # 全清空试算（精确给出剩余超载柱），但方案本身不存在：
+        # 页面建议重量保持原重量、减量 0，剩余超载柱用全清空结果列出。
+        zero_norm = copy.deepcopy(norm)
+        for L in zero_norm["layers"]:
+            L["wareWeight"] = 0.0
+        zero_trial = _calculate(zero_norm)
+        remaining = _overloaded_posts(zero_trial)
+        return _relief_payload(
+            norm,
+            baseline,
+            zero_trial,
+            list(ware0),
+            [0.0] * n,
+            False,
+            remaining,
+        )
+
+    # 建议重量：0.01 kg 向下取整（减量只多不少），再整架校验修补取整残差
+    counts = [len(_effective_posts(norm, i)) for i in range(n)]
+    suggested = [
+        w if reductions[i] <= RELIEF_EPS
+        else max(0.0, math.floor((w - reductions[i]) * 100.0 + 1e-6) / 100.0)
+        for i, w in enumerate(ware0)
+    ]
+    trial_norm = copy.deepcopy(norm)
+    for i, L in enumerate(trial_norm["layers"]):
+        L["wareWeight"] = suggested[i]
+
+    for _ in range(RELIEF_FIX_MAX_ITERS):
+        trial = _calculate(trial_norm)
+        over_layers = [
+            L["index"] for L in trial["layers"]
+            if any(p.get("overloaded") for p in L["posts"])
+        ]
+        if not over_layers:
+            break
+        # 取超载最高层：只在其所在有效柱链内向更高层找还能减的层
+        # （链顶之上若有不支撑层，其坯件减量传不到这里），优先取最高层
+        top_over = max(over_layers)
+        chain_top = top_over
+        while chain_top + 1 < n and counts[chain_top + 1] > 0:
+            chain_top += 1
+        target = None
+        for j in range(chain_top, top_over - 1, -1):
+            if trial_norm["layers"][j]["wareWeight"] >= RELIEF_FLOOR_STEP - 1e-9:
+                target = j
+                break
+        if target is None:
+            # 理论上不可达：贪心可行性已用精确 T0 判定通过
+            remaining = _overloaded_posts(trial)
+            return _relief_payload(
+                norm, baseline, trial, suggested,
+                [ware0[i] - suggested[i] for i in range(n)],
+                False, remaining,
+            )
+        trial_norm["layers"][target]["wareWeight"] = round(
+            trial_norm["layers"][target]["wareWeight"] - RELIEF_FLOOR_STEP, 2
+        )
+        suggested[target] = trial_norm["layers"][target]["wareWeight"]
+    else:  # pragma: no cover - 安全阀，正常工况几次迭代即收敛
+        trial = _calculate(trial_norm)
+
+    actual_reductions = [ware0[i] - suggested[i] for i in range(n)]
+    trial = _calculate(trial_norm)
+    remaining = _overloaded_posts(trial)
+    return _relief_payload(
+        norm,
+        baseline,
+        trial,
+        suggested,
+        actual_reductions,
+        not remaining,
+        remaining,
+    )
