@@ -29,6 +29,14 @@ let suggestSeq = 0;            // 试算请求序号，丢弃过期响应
 let suggestAppliedMsg = null;  // 确认加柱后的一次性提示
 const SUGGEST_COLOR = "#ffd54a";
 
+/* ================= 减载配额试算状态 =================
+ * shedData 只来自 POST /api/load-shed（或离线兜底），绝不写盘；
+ * 仅当用户点「按建议重量减载并保存」后，才把各层 wareWeight 写入 state 走 PUT /api/state。
+ */
+let shedData = null;           // 最近一次减载试算结果
+let shedSeq = 0;               // 试算请求序号，丢弃过期响应
+let shedAppliedMsg = null;     // 确认减载后的一次性提示
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -81,12 +89,19 @@ function collectState() {
 }
 
 /* ================= 重算 + 保存 + 渲染 ================= */
-async function recalcAndRender(applySuggestion) {
+async function recalcAndRender(applyChange) {
   const payload = collectState();
-  setSaveState("saving", applySuggestion ? "写入新柱并保存中…" : "重算并保存中…");
-  // 架体一经编辑/写盘，之前的加柱试算结果即作废（确认写入的那次除外）
-  if (!applySuggestion) invalidateSuggestions({ silent: true });
+  let label = "重算并保存中…";
+  if (applyChange === "suggest") label = "写入新柱并保存中…";
+  if (applyChange === "shed") label = "写入建议坯件重量并保存中…";
+  setSaveState("saving", label);
+  // 架体一经编辑/写盘，之前的加柱试算与减载试算结果即作废（确认写入的那次除外）
+  if (!applyChange) {
+    invalidateSuggestions({ silent: true });
+    invalidateShed({ silent: true });
+  }
   suggestAppliedMsg = null;
+  if (applyChange !== "shed") shedAppliedMsg = null;
   try {
     const res = await fetch("/api/state", {
       method: "PUT",
@@ -98,11 +113,13 @@ async function recalcAndRender(applySuggestion) {
     result = data.result;
     state = payload;
     setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
-    if (applySuggestion) suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
+    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
+    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已写入架体并触发自动保存";
   } catch (err) {
     setSaveState("error", "保存失败，仅本地重算");
     result = calculateLocal(payload);
-    if (applySuggestion) suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
+    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
+    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已加入本地编辑（后端不可用，未能保存）";
   }
   selection = selection && stillExists(selection) ? selection : null;
   // 编辑只更新基准；若正在推演，用同一失效选择在新基准上重跑（失效标记不保存）
@@ -338,7 +355,9 @@ $("#btnReset").addEventListener("click", async () => {
   selection = null;
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
+  invalidateShed({ silent: true });
   suggestAppliedMsg = null;
+  shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
   setSaveState("saved", "✓ 已恢复示例 " + new Date().toLocaleTimeString("zh-CN"));
 });
@@ -361,6 +380,7 @@ function renderResults() {
   renderSimPanel();
   renderSuggestOptions();
   renderSuggestPanel();
+  renderShedPanel();
 }
 
 function renderTotals() {
@@ -1099,7 +1119,7 @@ async function confirmSuggestPlan() {
   suggestData = null;
   suggestPreviewRank = null;
   renderEditor();
-  await recalcAndRender(true);
+  await recalcAndRender("suggest");
   selection = { kind: "post", layer: li, post: appliedId };
   renderDetail(); drawTop(); drawSide();
   renderSuggestPanel();
@@ -1261,6 +1281,167 @@ $("#btnConfirmSuggest").addEventListener("click", confirmSuggestPlan);
   const el = document.getElementById(id);
   if (el) el.addEventListener("change", () => { suggestAppliedMsg = null; renderSuggestPanel(); });
 });
+
+/* ================= 减载配额试算面板 ================= */
+/* 架体发生编辑/重置：上次减载方案作废（不影响已确认保存的数据） */
+function invalidateShed(opts) {
+  const wasActive = !!shedData;
+  shedData = null;
+  shedSeq++;
+  if (wasActive && !(opts && opts.silent)) renderShedPanel();
+  if (!opts || !opts.silent) renderShedPanel();
+}
+
+async function runLoadShed() {
+  if (!state) return;
+  const status = $("#shedStatus");
+  shedAppliedMsg = null;
+  status.textContent = "试算中…";
+  status.className = "badge has-sim";
+  const seq = ++shedSeq;
+  let data;
+  try {
+    const res = await fetch("/api/load-shed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== shedSeq) return;
+      shedData = null;
+      renderShedPanel((data && data.error) || `试算失败（HTTP ${res.status}）`);
+      return;
+    }
+  } catch (e) {
+    try {
+      data = loadShedLocal(state); // 离线兜底：与后端同一套算法
+    } catch (e2) {
+      if (seq !== shedSeq) return;
+      shedData = null;
+      renderShedPanel(e2.message);
+      return;
+    }
+  }
+  if (seq !== shedSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  shedData = data;
+  renderShedPanel();
+}
+
+async function confirmShed() {
+  if (!shedData || !shedData.feasible || !state) return;
+  const total = shedData.totalReduction;
+  const changed = shedData.layers.filter((L) => L.changed).length;
+  if (!confirm(`按建议重量下调 ${changed} 层坯件、合计减载 ${fmt(total)} kg？\n确认后写入架体并自动保存，棚板/立柱等其它数据不变。`)) return;
+  // 确认后才写入：逐层替换 wareWeight → 走原有编辑通道（PUT /api/state）自动保存
+  shedData.layers.forEach((row) => {
+    if (state.layers[row.index]) state.layers[row.index].wareWeight = row.wareSuggested;
+  });
+  shedData = null;
+  renderEditor();
+  await recalcAndRender("shed");
+  renderShedPanel();
+}
+
+function cancelShed() {
+  shedData = null;
+  renderShedPanel();
+}
+
+function renderShedPanel(errText) {
+  const out = $("#shedOutput");
+  const status = $("#shedStatus");
+  const btnCancel = $("#btnCancelShed");
+  const btnConfirm = $("#btnConfirmShed");
+  if (!out) return;
+  btnCancel.disabled = !shedData;
+  btnConfirm.disabled = !(shedData && shedData.feasible && shedData.totalReduction > 0);
+
+  if (shedAppliedMsg) {
+    status.textContent = "已减载";
+    status.className = "badge has-suggest";
+    out.innerHTML = `<p class="sug-applied">${escapeHtml(shedAppliedMsg)}</p>
+      <p class="muted" style="margin:4px 0 0">可继续编辑架体，或重新试算下一轮减载。</p>`;
+    return;
+  }
+  if (errText) {
+    status.textContent = "试算失败";
+    status.className = "badge";
+    out.innerHTML = `<p class="sug-error">⚠ ${escapeHtml(errText)}</p>`;
+    return;
+  }
+  if (!shedData) {
+    status.textContent = "未试算";
+    status.className = "badge";
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">点击「开始减载试算」：后端以当前架体为基准，只调整各层坯件重量，按现有整架分摊规则求消除全部超载的<b>最小总减载量</b>，并对方案重新整架校验。试算不会改动当前架体，确认后才写入并自动保存。</p>`;
+    return;
+  }
+
+  const m = shedData.metrics;
+  if (!shedData.feasible) {
+    status.textContent = "无解";
+    status.className = "badge has-error";
+    const remainRows = shedData.remainingOverloads.map((p) =>
+      `<li class="error"><span class="itype">超载</span><span>${escapeHtml(p.layerName)} 立柱 ${escapeHtml(p.post)}：清空坯件后载荷 ${fmt(p.load)} kg &gt; 容量 ${fmt(p.capacity)} kg</span></li>`
+    ).join("");
+    out.innerHTML = `
+      <p class="sug-error">🚫 ${escapeHtml(shedData.reason || "全部坯件清空仍有超载，仅靠减载无解")}</p>
+      <div class="sug-metrics">
+        <div class="sug-metric bad"><span>超载柱（减载前 → 全部清空）</span><b>${m.overloadCount.before} → ${m.overloadCount.after}</b><small>根</small></div>
+        <div class="sug-metric"><span>全部清空减载量</span><b>${fmt(shedData.totalReduction)}</b><small>kg</small></div>
+        <div class="sug-metric"><span>丢失载荷</span><b>${fmt(m.lostLoad.before)} → ${fmt(m.lostLoad.after)}</b><small>kg</small></div>
+        <div class="sug-metric"><span>传到台面</span><b>${fmt(m.carriedAtBottom.before)} → ${fmt(m.carriedAtBottom.after)}</b><small>kg</small></div>
+      </div>
+      <div class="sub-title">剩余超载柱（清空全部坯件后整架校验）</div>
+      <ul class="sug-issues">${remainRows}</ul>
+      ${shedLayerTable(shedData)}`;
+    return;
+  }
+
+  if (shedData.totalReduction === 0) {
+    status.textContent = "无需减载";
+    status.className = "badge";
+    out.innerHTML = `
+      <p class="sug-applied" style="color:var(--normal)">✓ 当前架体没有有限容量立柱超载，无需减载。</p>
+      ${shedLayerTable(shedData)}`;
+    return;
+  }
+
+  status.textContent = "有解 · 待确认";
+  status.className = "badge has-suggest";
+  out.innerHTML = `
+    <div class="sug-metrics">
+      <div class="sug-metric good"><span>超载柱（减载前 → 减载后）</span><b>${m.overloadCount.before} → ${m.overloadCount.after}</b><small>根</small></div>
+      <div class="sug-metric good"><span>最小总减载量</span><b>${fmt(shedData.totalReduction)}</b><small>kg</small></div>
+      <div class="sug-metric"><span>丢失载荷</span><b>${fmt(m.lostLoad.before)} → ${fmt(m.lostLoad.after)}</b><small>kg</small></div>
+      <div class="sug-metric"><span>传到台面</span><b>${fmt(m.carriedAtBottom.before)} → ${fmt(m.carriedAtBottom.after)}</b><small>kg</small></div>
+    </div>
+    <p class="hint" style="margin:2px 0 6px">下方为重新整架校验后的逐柱/逐层结果；点「✓ 按建议重量减载并保存」才写入架体并自动保存。</p>
+    ${shedLayerTable(shedData)}`;
+}
+
+function shedLayerTable(d) {
+  const rows = d.layers.map((L) => `
+    <tr class="${L.changed ? "target" : ""}">
+      <td>${escapeHtml(L.name)}</td>
+      <td>${fmt(L.wareOriginal)}</td>
+      <td><b>${fmt(L.wareSuggested)}</b></td>
+      <td class="down">${L.changed ? "−" + fmt(L.reduction) : "—"}</td>
+      <td>${L.overloadBefore} → <b>${L.overloadAfter}</b></td>
+      <td>${fmt(L.lostBefore)} → <b>${fmt(L.lostAfter)}</b></td>
+    </tr>`).join("");
+  return `
+    <div class="sug-table-wrap">
+      <table class="src-table sug-table">
+        <tr class="head"><td>层</td><td>原坯件重量 kg</td><td>建议重量 kg</td><td>本层减量</td><td>超载柱（前→后）</td><td>丢失载荷 kg（前→后）</td></tr>
+        ${rows}
+      </table>
+    </div>`;
+}
+
+$("#btnShed").addEventListener("click", runLoadShed);
+$("#btnCancelShed").addEventListener("click", cancelShed);
+$("#btnConfirmShed").addEventListener("click", confirmShed);
 
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
@@ -1638,4 +1819,185 @@ function suggestLocal(rawState, layer, spacing, capacity) {
     },
     plans, reason: null, toleranceMm: TOL_MM,
   };
+}
+
+/* ======================================================================
+ * 减载配额试算离线兜底：与 app/calc.py 的 load_shed 对齐（只算不存）
+ * 几何不变时各柱载荷关于层坯件重量为线性：
+ *   T_i = t0_i + Σ_{k=i..segTop[i]}(w_k - r_k)，约束为嵌套后缀减量和。
+ * ==================================================================== */
+function loadShedLocal(rawState) {
+  // 规范化一份可安全深改的架体（与 calculateLocal 同样的宽容规则）
+  const norm = (() => {
+    const car = {
+      name: (rawState.car && rawState.car.name) || "窑车台面",
+      w: Math.max(0, num(rawState.car && rawState.car.w)),
+      d: Math.max(0, num(rawState.car && rawState.car.d)),
+    };
+    const layers = (rawState.layers || []).map((l0, idx) => {
+      const b0 = l0.board || {};
+      return {
+        id: l0.id || "L" + idx,
+        name: l0.name || "第" + (idx + 1) + "层",
+        height: Math.max(0, num(l0.height)),
+        board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+        wareWeight: Math.max(0, num(l0.wareWeight)),
+        posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+      };
+    });
+    return { car, layers };
+  })();
+  const layers = norm.layers;
+  const n = layers.length;
+  const baseline = calculateLocal(norm);
+  const toUnits = (v) => Math.round(Math.max(0, v) * 100 + 1e-9);
+
+  const supportRect = (i) => i === 0
+    ? { x: 0, y: 0, w: norm.car.w, d: norm.car.d }
+    : { x: layers[i - 1].board.x, y: layers[i - 1].board.y, w: layers[i - 1].board.w, d: layers[i - 1].board.d };
+  const inRect = (x, y, rc) => x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.d;
+
+  // 与坯件无关的整架常量（保留精确浮点容量）：有效柱数 c、最小正容量 capmin、清零总载荷 t0
+  const c = new Array(n).fill(0);
+  const capmin = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    const rc = supportRect(i);
+    let cm = null;
+    layers[i].posts.forEach((p) => {
+      if (inRect(p.x, p.y, rc)) {
+        c[i]++;
+        if (p.capacity > 0 && (cm === null || p.capacity < cm)) cm = p.capacity;
+      }
+    });
+    capmin[i] = cm;
+  }
+  const t0 = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    const total = layers[i].board.weight + t0[i];
+    if (i > 0 && c[i] > 0) t0[i - 1] += total; // 有效柱均摊且全部下传；c=0 层载荷丢失
+    t0[i] = total;
+  }
+  // 连通层段顶（载荷自上而下，c=0 层截断）
+  const segTop = new Array(n).fill(0);
+  let top = n - 1;
+  for (let i = n - 1; i >= 0; i--) {
+    if (c[i] === 0) top = i - 1;
+    segTop[i] = top;
+  }
+  const w = layers.map((L) => Math.max(0, L.wareWeight));
+  const wu = w.map(toUnits); // 各层坯件重量（0.01 kg 整数单位）
+
+  // 连续意义上每个有限容量层所需后缀减量（kg）
+  const d = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (c[i] > 0 && capmin[i] !== null) {
+      let runWare = 0;
+      for (let k = i; k <= segTop[i]; k++) runWare += w[k];
+      const need = t0[i] + runWare - c[i] * capmin[i];
+      d[i] = need > 1e-9 ? need : 0;
+    }
+  }
+
+  const withWares = (arr) => {
+    const trialState = JSON.parse(JSON.stringify(norm));
+    trialState.layers.forEach((L, i) => { L.wareWeight = arr[i]; });
+    return calculateLocal(trialState);
+  };
+  const overloadPosts = (res) => {
+    const out = [];
+    res.layers.forEach((L) => L.posts.forEach((p) => {
+      if (p.overloaded) out.push({ layer: L.index, layerName: L.name, post: p.id, load: p.load, capacity: p.capacity });
+    }));
+    return out;
+  };
+  const countOver = (res) => res.layers.reduce((s, L) => s + L.posts.filter((p) => p.overloaded).length, 0);
+
+  // 0.01 kg 整数网格上的嵌套后缀约束贪心：先减本层、不足由近及远向上层回补
+  const greedyUnits = (dU) => {
+    const alloc = new Array(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+      if (c[i] === 0 || dU[i] <= 0) continue;
+      let rUpper = 0;
+      for (let k = i + 1; k <= segTop[i]; k++) rUpper += alloc[k];
+      if (dU[i] <= rUpper) continue;
+      let need = dU[i] - rUpper;
+      let take = Math.min(need, wu[i] - alloc[i]);
+      alloc[i] += take; need -= take;
+      for (let j = i + 1; need > 0 && j <= segTop[i]; j++) {
+        take = Math.min(need, wu[j] - alloc[j]);
+        alloc[j] += take; need -= take;
+      }
+    }
+    return alloc;
+  };
+
+  const buildResult = (feasible, suggested, reductions, trial, remaining, reason) => {
+    const rows = layers.map((L, i) => {
+      const bL = baseline.layers[i], tL = trial.layers[i];
+      const reduction = reductions[i];
+      return {
+        index: i, id: L.id, name: L.name,
+        wareOriginal: r2(w[i]), wareSuggested: r2(suggested[i]), reduction: r2(reduction),
+        changed: reduction > 1e-9,
+        supportedCount: bL.supportedCount,
+        overloadBefore: bL.posts.filter((p) => p.overloaded).length,
+        overloadAfter: tL.posts.filter((p) => p.overloaded).length,
+        lostBefore: bL.lostLoad, lostAfter: tL.lostLoad,
+      };
+    });
+    return {
+      ok: true, feasible, totalReduction: r2(reductions.reduce((s, v) => s + v, 0)),
+      layers: rows,
+      metrics: {
+        overloadCount: { before: countOver(baseline), after: countOver(trial) },
+        lostLoad: { before: baseline.totals.lostLoad, after: trial.totals.lostLoad },
+        carriedAtBottom: { before: baseline.totals.carriedAtBottom, after: trial.totals.carriedAtBottom },
+      },
+      baseline, trial, remainingOverloads: remaining, reason,
+    };
+  };
+
+  if (n === 0) {
+    return { ok: true, feasible: true, totalReduction: 0, layers: [], metrics: null, baseline, trial: baseline, remainingOverloads: [], reason: null };
+  }
+
+  // 全部坯件清空仍超载 → 无解，列出剩余超载柱（是否有解的唯一权威判据）
+  const cleared = withWares(new Array(n).fill(0));
+  const remainingCleared = overloadPosts(cleared);
+  if (remainingCleared.length) {
+    const totalW = w.reduce((s, v) => s + v, 0);
+    return buildResult(false, new Array(n).fill(0), w.slice(), cleared, remainingCleared,
+      `即使全部坯件清空（共减载 ${r2(totalW)} kg），仍有 ${remainingCleared.length} 根有限容量立柱超载；仅靠减载无法消除，请加柱、更换大容量柱或减轻棚板自重后再试`);
+  }
+
+  // 连续需求向上取整到 0.01 kg 整单位后贪心分配
+  const dU = d.map((dv) => (dv > 0 ? Math.ceil(dv * 100 - 1e-9) : 0));
+  let alloc = greedyUnits(dU);
+  const buildTrial = (al) => withWares(al.map((ru, i) => (ru === 0 ? w[i] : (wu[i] - ru) / 100)));
+  let trial = buildTrial(alloc);
+  let remaining = overloadPosts(trial);
+  if (remaining.length) {
+    // 极小概率（非网格容量边界）：从超载层起向其连通上层补 1 个网格单位并重算
+    for (let guard = 0; guard < wu.reduce((s, v) => s + v, 0) + 1 && remaining.length; guard++) {
+      const overLayers = [...new Set(remaining.map((p) => p.layer))].sort((a, b) => a - b);
+      let bumped = false;
+      for (const li of overLayers) {
+        for (let j = li; j <= segTop[li]; j++) {
+          if (alloc[j] < wu[j]) { alloc[j]++; bumped = true; break; }
+        }
+        if (bumped) break;
+      }
+      if (!bumped) break;
+      trial = buildTrial(alloc);
+      remaining = overloadPosts(trial);
+    }
+  }
+  if (remaining.length) {
+    // 安全兜底（清空已无超载，理论不可达）
+    return buildResult(false, new Array(n).fill(0), w.slice(), cleared, remainingCleared,
+      `试算方案重新整架校验时仍有 ${remaining.length} 根立柱超载，已按全部坯件清空返回剩余超载柱，请加柱或更换大容量柱`);
+  }
+  const suggested = alloc.map((ru, i) => (ru === 0 ? w[i] : (wu[i] - ru) / 100));
+  const reductions = w.map((wi, i) => wi - suggested[i]);
+  return buildResult(true, suggested, reductions, trial, [], null);
 }

@@ -624,6 +624,347 @@ def _diff_results(base: Dict[str, Any], sim: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# 减载配额试算（Load Shedding Quota）
+#
+# 几何/立柱不变、只允许下调各层坯件重量 w_i（0 ≤ r_i ≤ w_i，r_i 为本层减量）时，
+# 第 i 层棚板总载荷关于 r 是线性的：
+#
+#     T_i(r) = T0_i + Σ_{k∈run(i)} (w_k - r_k)
+#
+# 其中 T0_i 为全部坯件清零时第 i 层棚板总载荷（板自重 + 上层结构传递），
+# run(i) 为与第 i 层经“每层至少一根有效柱”连通的最高层到 i 的连续层段；
+# 某层 c_i=0（有效柱为 0，含全悬空/无柱）时载荷下传中断，层段在此截断。
+#
+# 本层有效柱均摊，最紧约束来自容量最小的有限容量柱：
+#
+#     T_i(r) ≤ c_i · capmin_i
+#
+# 即每个有限容量层给出一个“后缀减量和”下界：
+#
+#     Σ_{k=run(i)..i} r_k ≥ d_i
+#
+# 这是嵌套的覆盖型线性规划：层段内自顶向下，d_i 单调增长；最小总减量
+# R*_i = max(d_i, R*_{i-1})（跨 c=0 层重置），再按“优先减本层、不足部分
+# 由近及远向上层回补”分配各 r_k 即可达到该下界。
+# --------------------------------------------------------------------------
+def _to_units(v: float) -> int:
+    """把 kg 重量/容量就近换算为 0.01 kg 整数单位（消除二进制浮点尾差）。"""
+    return int(round(max(0.0, float(v)) * 100.0 + 1e-9))
+
+
+def _shed_constants(
+    norm: Dict[str, Any]
+) -> Tuple[List[int], List[Optional[float]], List[float]]:
+    """与坯件重量无关的整架常量：
+    返回 (c, capmin, t0)：
+      c[i]      第 i 层有效（非悬空）立柱数
+      capmin[i] 第 i 层有效柱中最小的正容量（无有限容量柱时为 None，保留精确原值）
+      t0[i]     全部坯件清零时第 i 层棚板总载荷（板自重 + 上层立柱传递）
+    """
+    layers = norm["layers"]
+    n = len(layers)
+    support_rects = [_support_rect_for(norm, i) for i in range(n)]
+    c = [0] * n
+    capmin: List[Optional[float]] = [None] * n
+    for i, L in enumerate(layers):
+        caps: List[float] = []
+        rect = support_rects[i]
+        for p in L["posts"]:
+            if in_rect(p["x"], p["y"], rect):
+                c[i] += 1
+                if p["capacity"] > 0:
+                    caps.append(p["capacity"])
+        if caps:
+            capmin[i] = min(caps)
+
+    t0 = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        # 处理第 i 层时，t0[i] 已累计第 i+1 层（及其上层）在坯件清零下的下传载荷
+        total = layers[i]["board"]["weight"] + t0[i]
+        if i > 0 and c[i] > 0:
+            t0[i - 1] += total  # 有效柱均摊且全部下传；c=0 层载荷丢失、不传递
+        t0[i] = total
+    return c, capmin, t0
+
+
+def _segment_tops(c: List[int]) -> List[int]:
+    """seg_top[i]：与第 i 层连通的最高层索引（载荷自上而下传递，c=0 层截断）。
+
+    第 i 层棚板总载荷受第 i..seg_top[i] 层坯件重量影响；同层段内层数越大越靠上。
+    """
+    seg_top = [0] * len(c)
+    top = len(c) - 1
+    for i in range(len(c) - 1, -1, -1):
+        if c[i] == 0:
+            top = i - 1
+        seg_top[i] = top
+    return seg_top
+
+
+def _shed_greedy_units(d_units: List[int], wu: List[int], c: List[int],
+                       seg_top: List[int]) -> List[int]:
+    """在 0.01 kg 整数网格上自顶向下分配各层减量单位（嵌套后缀覆盖约束贪心）。
+
+    d_units[i]：第 i 层要求的后缀减量单位下界（仅有限容量层 > 0）；
+    wu[i]：第 i 层可减的最大单位数。每层先减本层坯件，不足由近及远向上层
+    回补；返回各层减量单位 r_alloc_u。
+    """
+    n = len(wu)
+    r_alloc_u = [0] * n
+    for i in range(n - 1, -1, -1):
+        if c[i] == 0 or d_units[i] <= 0:
+            continue
+        r_upper = sum(r_alloc_u[i + 1:seg_top[i] + 1])
+        if d_units[i] <= r_upper:
+            continue  # 上层已分配的减量已覆盖本层约束
+        need = d_units[i] - r_upper
+        take = min(need, wu[i] - r_alloc_u[i])
+        r_alloc_u[i] += take
+        need -= take
+        j = i + 1  # 本层额度不足：由近及远向上层回补（均在同一连通层段内）
+        while need > 0 and j <= seg_top[i]:
+            take = min(need, wu[j] - r_alloc_u[j])
+            r_alloc_u[j] += take
+            need -= take
+            j += 1
+    return r_alloc_u
+
+
+def _overload_posts(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "layer": L["index"],
+            "layerName": L["name"],
+            "post": p["id"],
+            "load": p["load"],
+            "capacity": p["capacity"],
+        }
+        for L in res["layers"]
+        for p in L["posts"]
+        if p.get("overloaded")
+    ]
+
+
+def load_shed(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """减载配额试算：只调整各层坯件重量，求消除所有有限容量立柱超载的最小总减量。
+
+    几何（台面/棚板/立柱坐标与容量）完全不动；每层减量 r_i ∈ [0, w_i]。
+    多层载荷按现有“刚性棚板、有效柱均摊、悬空不承载、无有效柱则丢失”的
+    整架规则共同下传，因此超载约束是嵌套的后缀减量约束，存在闭式最优解。
+
+    求解先用精确浮点求出连续最优的各层后缀减量需求，再把需求向上取整到
+    0.01 kg 网格（页面录入/展示精度），在整数网格上自顶向下分配，最后用同一套
+    _calculate 重新整架校验；容量若不是 0.01 kg 的整数倍，取整只会留出安全
+    余量，不会造成误判。方案在 0.01 kg 网格上总减量最小（任一被减层回调
+    0.01 kg 都会再次超载）。
+
+    只计算、不修改输入、不写盘：返回每层原重量/建议重量/减量与减载前后的
+    超载数、丢失载荷；求得方案后用同一套 _calculate 重新整架校验。
+    若全部坯件清空仍有超载（棚板自重等结构载荷已超过容量），feasible=False，
+    并给出清空后的剩余超载柱清单。
+    """
+    norm = normalize(raw_state)
+    layers = norm["layers"]
+    n = len(layers)
+    baseline = _calculate(norm)
+
+    if n == 0:
+        return {
+            "feasible": True,
+            "totalReduction": 0.0,
+            "layers": [],
+            "baseline": baseline,
+            "trial": baseline,
+            "remainingOverloads": [],
+            "reason": None,
+        }
+
+    c, capmin, t0 = _shed_constants(norm)
+    seg_top = _segment_tops(c)
+    w = [max(0.0, L["wareWeight"]) for L in layers]
+    wu = [_to_units(v) for v in w]  # 各层坯件重量（0.01 kg 整数单位）
+
+    # 每个有限容量层连续意义上所需的后缀减量（kg）
+    d = [0.0] * n
+    for i in range(n):
+        if c[i] > 0 and capmin[i] is not None:
+            run_ware = sum(w[i:seg_top[i] + 1])
+            need = t0[i] + run_ware - c[i] * capmin[i]
+            d[i] = need if need > 1e-9 else 0.0
+
+    # 极端工况：全部坯件清空（最大可能减载）后整架重算，仍超载即无解。
+    # 这是“是否有解”的唯一权威判据（容量可能不是 0.01 整数倍，必须按精确值判）。
+    cleared_norm = _clone_norm(norm)
+    for L in cleared_norm["layers"]:
+        L["wareWeight"] = 0.0
+    cleared = _calculate(cleared_norm)
+    remaining_cleared = _overload_posts(cleared)
+    if remaining_cleared:
+        return _shed_result(
+            feasible=False,
+            layers=layers,
+            original=w,
+            suggested=[0.0] * n,
+            reductions=w,
+            baseline=baseline,
+            trial=cleared,
+            remaining=remaining_cleared,
+            reason=(
+                f"即使全部坯件清空（共减载 {r2(sum(w))} kg），仍有 "
+                f"{len(remaining_cleared)} 根有限容量立柱超载；仅靠减载无法消除，"
+                "请加柱、更换大容量柱或减轻棚板自重后再试"
+            ),
+        )
+
+    # 连续需求向上取整到 0.01 kg 整单位，再在整数网格上贪心分配各层减量
+    d_units = [0] * n
+    for i in range(n):
+        if d[i] > 0.0:
+            d_units[i] = int(math.ceil(d[i] * 100.0 - 1e-9))
+    r_alloc_u = _shed_greedy_units(d_units, wu, c, seg_top)
+
+    # 建议重量即整数网格上的原重量 − 减量（0.01 kg），本层无减量则原样返回
+    def _build_trial(alloc_u: List[int]) -> Dict[str, Any]:
+        trial_norm = _clone_norm(norm)
+        for k, L in enumerate(trial_norm["layers"]):
+            L["wareWeight"] = w[k] if alloc_u[k] == 0 else (wu[k] - alloc_u[k]) / 100.0
+        return _calculate(trial_norm)
+
+    trial = _build_trial(r_alloc_u)
+    remaining = _overload_posts(trial)
+    if remaining:
+        # 极小概率（浮点/非网格容量边界）：取整方案被权威整架校验判超载。
+        # 清空已证明有解 → 自超载层起向其连通上层补 1 个网格单位并重算，直到通过。
+        for _ in range(sum(wu) + 1):
+            over_layers = {p["layer"] for p in remaining}
+            bumped = False
+            for li in sorted(over_layers):
+                for j in range(li, seg_top[li] + 1):
+                    if r_alloc_u[j] < wu[j]:
+                        r_alloc_u[j] += 1
+                        bumped = True
+                        break
+                if bumped:
+                    break
+            if not bumped:
+                break
+            trial = _build_trial(r_alloc_u)
+            remaining = _overload_posts(trial)
+            if not remaining:
+                break
+        if remaining:
+            # 理论不可达（清空已无超载）；安全兜底按无解返回
+            return _shed_result(
+                feasible=False,
+                layers=layers,
+                original=w,
+                suggested=[0.0] * n,
+                reductions=w,
+                baseline=baseline,
+                trial=cleared,
+                remaining=remaining_cleared,
+                reason=(
+                    f"试算方案重新整架校验时仍有 {len(remaining)} 根立柱超载，"
+                    "已按全部坯件清空返回剩余超载柱，请加柱或更换大容量柱"
+                ),
+            )
+
+    suggested = [
+        w[i] if r_alloc_u[i] == 0 else (wu[i] - r_alloc_u[i]) / 100.0 for i in range(n)
+    ]
+    return _shed_result(
+        feasible=True,
+        layers=layers,
+        original=w,
+        suggested=suggested,
+        reductions=[w[i] - suggested[i] for i in range(n)],
+        baseline=baseline,
+        trial=trial,
+        remaining=[],
+        reason=None,
+    )
+
+
+def _clone_norm(norm: Dict[str, Any]) -> Dict[str, Any]:
+    """深拷贝 normalize() 后的架体（结构简单，手写避免引入 copy 外的依赖约定）。"""
+    return {
+        "car": dict(norm["car"]),
+        "layers": [
+            {
+                "id": L["id"],
+                "name": L["name"],
+                "height": L["height"],
+                "board": dict(L["board"]),
+                "wareWeight": L["wareWeight"],
+                "posts": [dict(p) for p in L["posts"]],
+            }
+            for L in norm["layers"]
+        ],
+    }
+
+
+def _shed_result(
+    *,
+    feasible: bool,
+    layers: List[Dict[str, Any]],
+    original: List[float],
+    suggested: List[float],
+    reductions: List[float],
+    baseline: Dict[str, Any],
+    trial: Dict[str, Any],
+    remaining: List[Dict[str, Any]],
+    reason: Optional[str],
+) -> Dict[str, Any]:
+    before = {L["index"]: L for L in baseline["layers"]}
+    after = {L["index"]: L for L in trial["layers"]}
+    rows: List[Dict[str, Any]] = []
+    for i, L in enumerate(layers):
+        bL, tL = before[i], after[i]
+        over_before = sum(1 for p in bL["posts"] if p.get("overloaded"))
+        over_after = sum(1 for p in tL["posts"] if p.get("overloaded"))
+        reduction = reductions[i]
+        rows.append(
+            {
+                "index": i,
+                "id": L["id"],
+                "name": L["name"],
+                "wareOriginal": r2(original[i]),
+                "wareSuggested": r2(suggested[i]),
+                "reduction": r2(reduction),
+                "changed": reduction > 1e-9,
+                "supportedCount": bL["supportedCount"],
+                "overloadBefore": over_before,
+                "overloadAfter": over_after,
+                "lostBefore": bL["lostLoad"],
+                "lostAfter": tL["lostLoad"],
+            }
+        )
+    return {
+        "feasible": feasible,
+        "totalReduction": r2(sum(reductions)),
+        "layers": rows,
+        "metrics": {
+            "overloadCount": {
+                "before": _count_overloaded(baseline),
+                "after": _count_overloaded(trial),
+            },
+            "lostLoad": {
+                "before": baseline["totals"]["lostLoad"],
+                "after": trial["totals"]["lostLoad"],
+            },
+            "carriedAtBottom": {
+                "before": baseline["totals"]["carriedAtBottom"],
+                "after": trial["totals"]["carriedAtBottom"],
+            },
+        },
+        "baseline": baseline,
+        "trial": trial,
+        "remainingOverloads": remaining,
+        "reason": reason,
+    }
+
+
+# --------------------------------------------------------------------------
 # 加柱建议（Suggest Post）：在目标层候选网格上逐点试算新增一根立柱
 # --------------------------------------------------------------------------
 def _support_rect_for(norm: Dict[str, Any], i: int) -> Dict[str, float]:

@@ -322,6 +322,15 @@ ul.sug-issues li .itype { flex: 0 0 30px; font-size: 10px; }
 ul.sug-issues li.is-added .itype { color: var(--error); }
 ul.sug-issues li.is-removed .itype { color: var(--normal); }
 
+/* ---------- 减载配额试算 ---------- */
+.shed-panel { border-style: dashed; border-color: #205a48; }
+.shed-panel .suggest-form { grid-template-columns: auto; justify-content: start; }
+.shed-panel .btn-run { border-color: var(--normal); color: var(--normal); }
+.shed-panel .btn-run:hover { background: rgba(52,192,138,0.12); }
+.shed-panel .badge.has-error { color: var(--error); border-color: var(--error); }
+.sug-table td.down { color: var(--normal); font-size: 11px; }
+.shed-panel tr.target td b { color: var(--normal); }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }

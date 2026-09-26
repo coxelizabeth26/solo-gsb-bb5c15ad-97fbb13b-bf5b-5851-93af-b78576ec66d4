@@ -12,6 +12,10 @@ POST /api/simulate   立柱失效推演：body {"state": 架体JSON(可省), "fa
 POST /api/suggest    加柱建议：body {"state"(可省), "layer": 0, "spacing": 200, "capacity": 300}，
                      在目标层承托面内按候选网格逐点试算新增一根立柱，返回前 5 个方案；
                      只计算，不写盘；用户确认后由前端走 PUT /api/state 正式写入
+POST /api/load-shed  减载配额试算：body {"state"(可省)}，只下调各层坯件重量，求消除
+                     全部有限容量立柱超载的最小总减载量，按现有整架分摊规则约束并
+                     重新整架校验；只计算，不写盘；用户确认后由前端走 PUT /api/state
+                     把建议坯件重量正式写入
 POST /api/reset      恢复内置示例数据
 """
 
@@ -23,7 +27,7 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, simulate, suggest_posts
+from .calc import calculate, load_shed, simulate, suggest_posts
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -135,6 +139,17 @@ def api_suggest():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/load-shed", methods=["POST"])
+def api_load_shed():
+    """减载配额试算：只调整坯件重量求最小总减载量。只计算，不写盘、不改已保存状态。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    return jsonify({"ok": True, **load_shed(state)})
 
 
 if __name__ == "__main__":

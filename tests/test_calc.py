@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.calc import calculate, normalize, simulate, suggest_posts  # noqa: E402
+from app.calc import calculate, load_shed, normalize, simulate, suggest_posts  # noqa: E402
 
 SAMPLE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -477,6 +477,321 @@ class CalcTests(unittest.TestCase):
         state = self._overload_state()
         before = json.loads(json.dumps(state, ensure_ascii=False))
         suggest_posts(state, 0, 100, 300)
+        self.assertEqual(state, before)
+
+    # ---------------- 减载配额试算 ----------------
+    def _two_layer_state(self, bottom_ware, bottom_cap, top_ware=400, top_cap=0, board=100):
+        return {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": board},
+                    "wareWeight": bottom_ware,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": bottom_cap},
+                        {"id": "B", "x": 900, "y": 900, "capacity": bottom_cap},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": board},
+                    "wareWeight": top_ware,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": top_cap},
+                        {"id": "D", "x": 800, "y": 800, "capacity": top_cap},
+                    ],
+                },
+            ],
+        }
+
+    def test_shed_single_layer_minimum_reduction(self):
+        # board 100 + ware 100 = 200，2 柱容量 80：均摊 100 > 80 → 总载荷须 ≤160 → 减 40
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 80},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 80},
+                    ],
+                }
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 40.0)
+        self.assertEqual(r["layers"][0]["wareOriginal"], 100.0)
+        self.assertEqual(r["layers"][0]["wareSuggested"], 60.0)
+        # 重新整架校验：超载 2 → 0
+        self.assertEqual(r["metrics"]["overloadCount"], {"before": 2, "after": 0})
+        self.assertFalse(
+            any(p["overloaded"] for L in r["trial"]["layers"] for p in L["posts"])
+        )
+        # 不修改输入
+        self.assertEqual(state["layers"][0]["wareWeight"], 100)
+
+    def test_shed_prefers_same_layer_then_backfills_upper(self):
+        # 顶层 2 柱不限容量；底层总载荷 = 100(板)+20(坯)+500(顶) = 620，
+        # 容量上限 2×280=560 → 需后缀减 60；本层坯件仅 20 → 本层减 20、顶层补 40
+        r = load_shed(self._two_layer_state(20, 280))
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 60.0)
+        self.assertEqual(r["layers"][0]["reduction"], 20.0)
+        self.assertEqual(r["layers"][1]["reduction"], 40.0)
+        self.assertFalse(
+            any(p["overloaded"] for L in r["trial"]["layers"] for p in L["posts"])
+        )
+        # 最小性：顶层减得比它自身（无容量约束）所需多，全部是为底层服务；60 是下界
+        self.assertEqual(r["layers"][1]["wareSuggested"], 360.0)
+
+    def test_shed_nested_constraints_minimum_total(self):
+        # 顶层：100+400=500 > 2×200=400 → 顶层后缀须减 100
+        # 底层：100+50+500=650 > 2×200=400 → 两后缀合计须减 250（覆盖顶层的 100）
+        r = load_shed(self._two_layer_state(50, 200, top_cap=200))
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 250.0)  # 不是 100+250 的重复计算
+        # 先减本层：底层坯件 50 全部减掉，其余 200 由顶层承担
+        self.assertEqual(r["layers"][0]["reduction"], 50.0)
+        self.assertEqual(r["layers"][1]["reduction"], 200.0)
+        self.assertEqual(r["layers"][1]["wareSuggested"], 200.0)
+        self.assertEqual(r["metrics"]["overloadCount"], {"before": 4, "after": 0})
+
+    def test_shed_no_overload_returns_zero_plan(self):
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [{"id": "A", "x": 100, "y": 100, "capacity": 500}],
+                }
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 0.0)
+        self.assertFalse(r["layers"][0]["changed"])
+        self.assertEqual(r["layers"][0]["wareSuggested"], 100.0)
+
+    def test_shed_infeasible_when_board_alone_overloads(self):
+        # 单层：板自重 200，2 柱容量 80 → 坯件清空后均摊仍 100 > 80，无解
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 200},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 80},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 80},
+                    ],
+                }
+            ],
+        }
+        r = load_shed(state)
+        self.assertFalse(r["feasible"])
+        self.assertEqual(len(r["remainingOverloads"]), 2)
+        self.assertEqual({p["post"] for p in r["remainingOverloads"]}, {"A", "B"})
+        self.assertIn("清空", r["reason"])
+        # 无解时给的是“全部清空”后的整架校验结果与逐层行
+        self.assertEqual(r["metrics"]["overloadCount"]["after"], 2)
+        self.assertEqual(r["layers"][0]["wareSuggested"], 0.0)
+        self.assertEqual(r["layers"][0]["reduction"], 100.0)
+
+    def test_shed_infeasible_upper_layer_board_overload(self):
+        # 顶板自重 500、单柱容量 200：清空坯件后顶柱仍超载；底层柱不限容量
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 0},
+                    "wareWeight": 0,
+                    "posts": [{"id": "A", "x": 500, "y": 500, "capacity": 0}],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 500},
+                    "wareWeight": 100,
+                    "posts": [{"id": "T", "x": 500, "y": 500, "capacity": 200}],
+                },
+            ],
+        }
+        r = load_shed(state)
+        self.assertFalse(r["feasible"])
+        self.assertTrue(any(p["layer"] == 1 for p in r["remainingOverloads"]))
+
+    def test_shed_zero_support_layer_breaks_chain(self):
+        # 中间层无立柱 → 顶层载荷在此丢失，不压到底层；
+        # 底层 100+500=600 单柱容量 200 → 只需底层减 400；中/顶层坯件不动
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 500,
+                    "posts": [{"id": "A", "x": 100, "y": 100, "capacity": 200}],
+                },
+                {
+                    "name": "中",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 500,
+                    "posts": [],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 500,
+                    "posts": [{"id": "C", "x": 200, "y": 200, "capacity": 0}],
+                },
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["layers"][0]["reduction"], 400.0)
+        self.assertEqual(r["layers"][1]["reduction"], 0.0)
+        self.assertEqual(r["layers"][2]["reduction"], 0.0)
+        # 中/顶层丢失载荷不变（未减它们的坯件）
+        self.assertEqual(r["layers"][1]["lostBefore"], r["layers"][1]["lostAfter"])
+
+    def test_shed_three_layer_backfill_order(self):
+        # 三层各 300 坯件、板自重 0；底层单柱容量 450：
+        # 顶层 300 → 中层 600 → 底层 900 > 450，后缀须减 450；
+        # 先减底层 300，再由近及远减中层 150，顶层不动
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 0},
+                    "wareWeight": 300,
+                    "posts": [{"id": "A", "x": 500, "y": 500, "capacity": 450}],
+                },
+                {
+                    "name": "中",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 0},
+                    "wareWeight": 300,
+                    "posts": [
+                        {"id": "M", "x": 300, "y": 300, "capacity": 0},
+                        {"id": "N", "x": 700, "y": 700, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 0},
+                    "wareWeight": 300,
+                    "posts": [{"id": "T", "x": 500, "y": 500, "capacity": 0}],
+                },
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 450.0)
+        self.assertEqual(
+            [L["reduction"] for L in r["layers"]], [300.0, 150.0, 0.0]
+        )
+        self.assertEqual(r["metrics"]["overloadCount"]["after"], 0)
+
+    def test_shed_quantization_grid_minimum(self):
+        # 连续最优减量 0.03 kg（恰好 3 个 0.01 单位）：建议重量 0.02；
+        # 回调 0.01（0.03，均摊 50.015 > 容量 50.01）会重新超载 → 网格上总减量最小
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 0.05,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 50.01},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 50.01},
+                    ],
+                }
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["layers"][0]["wareSuggested"], 0.02)
+        self.assertFalse(
+            any(p["overloaded"] for L in r["trial"]["layers"] for p in L["posts"])
+        )
+        # 网格最小性：建议重量 +0.01（=0.03）后必再次超载
+        probe = json.loads(json.dumps(state))
+        probe["layers"][0]["wareWeight"] = 0.03
+        self.assertTrue(
+            any(
+                p["overloaded"]
+                for L in calculate(probe)["layers"]
+                for p in L["posts"]
+            )
+        )
+
+    def test_shed_fractional_need_rounds_up_to_whole_grid_unit(self):
+        # 板自重 1000 + 坯件 200 = 1200，2 柱容量 599.99 → 上限 1199.98，
+        # 连续最优减量 0.02 kg（恰好 2 个 0.01 网格单位）：建议 199.98；
+        # 回调 0.01（199.99，均摊 599.995 > 599.99）会再次超载
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 1000},
+                    "wareWeight": 200.00,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 599.99},
+                        {"id": "B", "x": 900, "y": 900, "capacity": 599.99},
+                    ],
+                }
+            ],
+        }
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["layers"][0]["wareSuggested"], 199.98)
+        self.assertEqual(r["layers"][0]["reduction"], 0.02)
+        probe = json.loads(json.dumps(state))
+        probe["layers"][0]["wareWeight"] = 199.99  # 均摊 599.995 > 599.99 → 再次超载
+        self.assertTrue(
+            any(p["overloaded"] for L in calculate(probe)["layers"] for p in L["posts"])
+        )
+
+    def test_shed_empty_rack(self):
+        r = load_shed({"car": {"w": 1000, "d": 1000}, "layers": []})
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["totalReduction"], 0.0)
+        self.assertEqual(r["layers"], [])
+
+    def test_shed_sample_state_feasible_and_verified(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        r = load_shed(state)
+        self.assertTrue(r["feasible"])
+        # 方案经同一套 calculate 重新整架校验：零超载
+        self.assertFalse(
+            any(p["overloaded"] for L in r["trial"]["layers"] for p in L["posts"])
+        )
+        # 减量守恒：减载量 == 原坯件合计 − 建议坯件合计
+        self.assertAlmostEqual(
+            r["totalReduction"],
+            sum(L["wareOriginal"] - L["wareSuggested"] for L in r["layers"]),
+            places=6,
+        )
+        # 每层减量不超过其原坯件重量
+        for L in r["layers"]:
+            self.assertGreaterEqual(L["reduction"], 0.0)
+            self.assertLessEqual(L["reduction"], L["wareOriginal"] + 1e-9)
+
+    def test_shed_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        before = json.loads(json.dumps(state, ensure_ascii=False))
+        load_shed(state)
         self.assertEqual(state, before)
 
 

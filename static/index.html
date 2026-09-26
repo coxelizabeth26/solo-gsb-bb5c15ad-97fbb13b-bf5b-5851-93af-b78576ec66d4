@@ -121,6 +121,27 @@
         <div id="suggestOutput"></div>
       </div>
 
+      <div class="panel shed-panel">
+        <div class="sim-head">
+          <h2>⚖️ 减载配额试算 <span id="shedStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelShed" class="btn btn-ghost" type="button" disabled>✕ 取消试算（不改数据）</button>
+            <button id="btnConfirmShed" class="btn btn-confirm" type="button" disabled>✓ 按建议重量减载并保存</button>
+          </div>
+        </div>
+        <p class="hint">
+          以当前架体为基准，<b>只下调各层坯件重量</b>（棚板/立柱/坐标/容量均不变），在每层减量不超过
+          现有坯件重量的条件下，求让全部<b>有限容量立柱不再超载</b>的<b>最小总减载量</b>。多层坯件载荷
+          会经现有整架分摊规则共同压到下层立柱，求解后按原规则<b>重新整架校验</b>。试算
+          <span class="hl">不写入状态</span>；确认后才把建议坯件重量写入架体并沿用自动保存，
+          一旦继续编辑架体，旧方案立即作废。
+        </p>
+        <div class="suggest-form">
+          <button id="btnShed" class="btn btn-run" type="button">开始减载试算</button>
+        </div>
+        <div id="shedOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>
